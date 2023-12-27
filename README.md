@@ -4,3 +4,8 @@ First, I conducted an exploratory data analysis to determine skewness, distribut
 File Descriptions: 
 <br />
 Predict-MDRTB.Rmd: R-Markdown file that consists of code, analysis and guide of what I did in each step of the analysis. Discussion and Conclusion of analysis is also included. 
+<br />
+Predict-MDRTB.docx: Word Document of the knitted R-Markdown file
+<br />
+Final Paper.docx: Final report consisting of Introduction, Methods, Results, Discussion, Conclusion. 
+<br />
