@@ -1,0 +1,199 @@
+---
+title: "Predict MDR-TB"
+author: "Alyssa Santoso"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r setup2}
+library(readxl)
+library(dplyr)
+library(writexl)
+library(moments)
+library(psych)
+library(car)
+library(ggplot2)
+library(ISLR2)
+library(randomForest)
+library(caret)
+library(gbm)
+library(purrr)
+
+moldova <- read_excel("/Users/maddysantoso/Downloads/Moldova_data.xlsx",  col_names = TRUE)
+```
+
+Some data cleaning and variable selection. 
+Variables chosen to use: 
+Continuous Data: household_size, age_at_diagnosis 
+Categorical Data: prev_treatment, location, HIV_test , citizenship, Gender_P6, ocupation_P9, salary_P9_a, type_TB
+Outcome variable: resistant (yes/no)
+```{r cleaning}
+# Make variable resistant= yes/no (1/0)
+moldova$resistant <- ifelse(moldova$P21_H == TRUE & moldova$P21_R == TRUE, "Yes", "No")
+moldova$resistant <- factor(moldova$resistant, levels = c("Yes", "No"))
+
+# Make variable prev_treatment= Yes/No using P23
+moldova$prev_treatment <- ifelse(moldova$P23 == 2, "No", "Yes")
+moldova$prev_treatment <- factor(moldova$prev_treatment, levels = c("Yes", "No"))
+
+#rename urban-rural_P5_c
+moldova <- moldova %>%
+  rename(location = `urban-rural_P5_c`)
+
+#rename p24
+moldova <- moldova %>%
+  rename(type_TB = P24)
+
+#rename p13
+moldova <- moldova %>%
+  rename(household_size = P13)
+
+
+# Make variable HIV_test= Positive/Negative/Unknown 
+moldova$HIV_test <- ifelse(moldova$aP28 == 2, "Positive", 
+                           ifelse(moldova$aP28 == 3, "Negative", "Unknown"))
+
+#age_at_diagnosis variable 
+moldova <- moldova %>%
+  mutate(age_at_diagnosis = as.numeric(difftime(P14, birth_day, units = "days")) / 365.25)
+
+selected_variables <- c("household_size", "age_at_diagnosis", "resistant", "prev_treatment", "location", "HIV_test", 
+                        "citizenship", "Gender_P6", "ocupation_P9", "salary_P9_a", "type_TB")
+moldova2 <- subset(moldova, select=selected_variables)
+moldova2 <- na.omit(moldova2) # omit NA rows 
+```
+
+Exploratory Data Analysis to further understand the dataset. 
+For continuous variables, I will check the distribution, normality and outliers. 
+For categorical and discrete variables, I examined frequency using tables and bar charts. Furthermore, I performed a chi-squared analysis to test associations for each pair of categorical variables, and to aid in variable selection. 
+```{r EDA, echo=FALSE}
+moldova2[,c("household_size", "age_at_diagnosis")] %>% pairs.panels(star=T)
+```
+```{r EDA2, echo=FALSE}
+# Check outliers using boxplot 
+lapply(moldova2[,c("household_size", "age_at_diagnosis")],scale) %>%
+  boxplot()
+```
+
+```{r EDA3, echo=FALSE}
+# Check skewness for normality
+skewness(moldova2[,c("household_size", "age_at_diagnosis")])
+```
+
+```{r EDA4, echo=FALSE}
+# examine frequency counts for categorical and discrete variables
+categorical_vars <- c("resistant", "prev_treatment", "location", "HIV_test", 
+                      "citizenship", "Gender_P6", "ocupation_P9", "salary_P9_a", "type_TB")
+
+lapply(moldova2[categorical_vars], table) # Contingency table 
+
+
+prop_table <- list() # proportions table
+for (var in categorical_vars) {
+  prop <- prop.table(table(moldova2[[var]]))*100
+  prop_table[[var]] <- prop
+}
+prop_table
+```
+
+```{r EDA5, echo=FALSE}
+# bar chart 
+par(mfrow = c(3, 3))  # 3 rows, 3 columns
+for (var in categorical_vars) {
+  bar_chart <- barplot(table(moldova2[[var]]), main = var, col = "skyblue")
+  print(bar_chart)
+}
+```
+
+```{r EDA6, echo=FALSE}
+# chi squared analysis
+# Perform chi-squared test for each pair of categorical variables
+for (var1 in categorical_vars) {
+  for (var2 in setdiff(categorical_vars, var1)) {
+    contingency_table <- table(moldova2[[var1]], moldova2[[var2]])
+    chi_squared_result <- chisq.test(contingency_table)
+    cat("Chi-Squared Test between", var1, "and", var2, ":\n")
+    print(chi_squared_result)
+    cat("\n")
+  }
+}
+```
+There were 11,501 data on patients who were confirmed, through  drug susceptibility testing (DST), not to have MDR-TB. Based on the Explaratory Data Analysis, there is a significant proportion of patients who are resistant to treatment (14.7%), while the majority have not undergone previous treatment (68.8%). Geographically, the dataset encompasses a mix of rural (47.1%) and urban (52.9%) locations. The HIV testing results indicate a predominant negative status (73.2%). The vast majority of patients hold Moldovan citizenship (99.6%), and there is a male predominance (73.9%) in the gender distribution. Occupational diversity is evident, with a substantial portion of the population being unemployed (62.8%). Moreover, there is a significant number who are not salaried (69.2%). The types of tuberculosis vary, with those who have never had TB (new cases) being the most prevalent (68.0%) and the least being those who started treatment abroad and so details of previous TB episodes are unknown being the least cases (0.548%). For the continuous variables, household size and age at diagnosis, there is a negative weak linear relationship (r=-0.12) among these predictors based on the pairwise correlations making collinearity unlikely. Furthermore, household size was skewed to the right while age at diagnosis is approximately symmetrical, with skewness values of 2.14 and 0.17, respectively. The boxplot of variables showed household size and age at diagnosis, showing great outliers in household size. I chose not to normalize this as it would be more meaningful to keep the data as is. The chi-squared analysis revealed that all variables, except citizenship, exhibit significant associations with resistance status.
+
+## Model Building
+Below, I tested and trained 3 models (Classification trees, random forests, gradient boost machine) to see which model performs best to predict MDR-TB in Moldova. 
+# Classification Tree Model
+```{r CT, echo=FALSE}
+set.seed(123)
+sampling_index <- sample(1:nrow(moldova2), 0.8 * nrow(moldova2))
+train <- moldova2[sampling_index, ]
+test <- moldova2[-sampling_index, ]
+control <- trainControl(method="cv",
+                        number = 10,
+                        classProbs = TRUE,
+                        summaryFunction =twoClassSummary,
+                        savePredictions = 'all')
+### model 1: classification trees 
+model_trees <-  train(resistant  ~., 
+                      data = train,
+                      method = "rpart", 
+                      metric = 'ROC', 
+                      trControl = control)
+
+# prediction on test dataset
+pred_trees <- predict(model_trees, test)
+cm_trees <- confusionMatrix(pred_trees, test$resistant)
+```
+
+# Random Forest Model
+```{r RF, echo=FALSE}
+### model 2: random forest
+model_rf <- train(resistant ~., 
+                  data = train,
+                  method = "rf", 
+                  metric = 'ROC', 
+                  trControl = control)
+# prediction on test dataset
+pred_rf <- predict(model_rf, test)
+cm_rf <- confusionMatrix(pred_rf, test$resistant)
+varImpPlot(model_rf$finalModel, sort = TRUE, n.var = 10, main = "The 10 variables with the most predictive power")
+
+```
+# Gradient Boost Machine Model
+```{r GBM, echo=FALSE}
+### model 3: gradient boost machine
+model_gbm <- train(resistant ~.,
+                   data = train,
+                   method = "gbm", 
+                   metric = 'ROC', 
+                   trControl = control)
+#prediction on test dataset
+pred_gbm <- predict(model_gbm, test)
+cm_gbm <- confusionMatrix(pred_gbm, test$resistant)
+summary(model_gbm$finalModel)
+```
+
+Below, I performed model comparison of the 3 models. Analysis was done through ROC, accuracy, sensitivy and specificity measures. 
+```{r Compare, echo=FALSE}
+### Model Comparison
+model_list <- list(rf = model_rf, gbm=model_gbm, trees=model_trees)
+results <- resamples(model_list)
+summary(results)
+bwplot(results, metric = "ROC")
+
+cm_list <- list(cm_rf = cm_rf, cm_gbm=cm_gbm, cm_trees=cm_trees)
+results <- map_df(cm_list, function(x) x$byClass) 
+row.names(results) <- names(cm_list)
+summary(results)
+```
+## Discussion and Conclusion
+This study aimed to build the best model for predicting whether an individual in Moldova will develop MDR-TB based on demographic and clinical variables. The results from the analyses of confusion matrices and associated statistics indicate that random forest is the best model in predicting MDR-TB cases in Moldova. On the training dataset, the model achieved the highest sensitivity among the 3 models, but comparable results on ROC and specificity values. On the testing dataset, the model achieved an overall accuracy of 85.01% on the test dataset, and demonstrated a sensitivity of 19.09%, indicating its ability to correctly identify resistant cases, while maintaining a high specificity of 96.04%, suggesting proficiency in recognizing non-resistant cases. The model's balanced accuracy stands at 57.57%, indicating a reasonable balance between sensitivity and specificity in predicting resistance status. This model predicted age at diagnosis to have the most predictive power and HIV test results to be the lowest predictive power. Though random forest achieved a moderate discriminatory power based on its ROC value, it is important to note that this study chose to prioritize the model’s ability to identify true positive rate as a crucial metric– and in this context would be the model's ability to correctly identify individuals with MDR-TB. The emphasis on sensitivity is justified in the context of MDR-TB, where early and accurate detection of positive cases is crucial for effective treatment and prevention of further transmission.
+The random forest model identified the variable age at diagnosis as the most influential variable in determining the likelihood of MDR-TB. This indicates that among the considered factors, the age at which individuals are diagnosed with TB carries the highest weight in the model's ability to accurately predict MDR-TB cases. The importance of age at diagnosis emphasizes its significance in predicting the risk of MDR-TB development. This finding implies that healthcare professionals and policymakers should take into account the patient’s age when developing interventions or preventive measures, as individuals diagnosed at different ages may exhibit varying susceptibilities to multi-drug resistance. 	
+
